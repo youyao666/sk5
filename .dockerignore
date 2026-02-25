@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+.vscode/
+*.7z
+*.zip
+*.log
+sk5/
+sk5pro/

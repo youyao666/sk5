@@ -1,0 +1,36 @@
+mixed-port: 7890
+allow-lan: false
+mode: global
+log-level: info
+ipv6: true
+
+proxies:
+  - name: sk5-ciallo
+    type: socks5
+    server: 155.103.67.133
+    port: 1080
+    username: "2602:f66f:70:84::a"
+    password: "dongxuelian1010"
+    udp: false
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - sk5-ciallo
+      - DIRECT
+
+rules:
+  - MATCH,PROXY
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: true
+  enhanced-mode: fake-ip
+  nameserver:
+    - 223.5.5.5
+    - 1.1.1.1
+  fallback:
+    - tls://1.1.1.1:853
+    - tls://8.8.8.8:853

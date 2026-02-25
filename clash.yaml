@@ -1,0 +1,61 @@
+mixed-port: 7890
+allow-lan: false
+mode: global
+log-level: info
+ipv6: false
+
+tun:
+  enable: false
+
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: redir-host
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
+proxies:
+  # 你的自建 SOCKS5
+  - name: sk5-ciallo
+    type: socks5
+    server: 155.103.67.133
+    port: 443
+    username: "2602:f66f:70:84::a"
+    password: "dongxuelian1010"
+    udp: false
+
+  # 上游代理（请替换成你真实可用的上游）
+  - name: upstream
+    type: socks5
+    server: 1.2.3.4
+    port: 1080
+    username: "your_user"
+    password: "your_pass"
+    udp: false
+
+proxy-groups:
+  # 链式方案A：先走上游，再走你自建节点（一般更符合“本地网络限制”的场景）
+  - name: CHAIN-A
+    type: relay
+    proxies:
+      - upstream
+      - sk5-ciallo
+
+  # 链式方案B：先走你自建节点，再走上游（备用）
+  - name: CHAIN-B
+    type: relay
+    proxies:
+      - sk5-ciallo
+      - upstream
+
+  - name: PROXY
+    type: select
+    proxies:
+      - CHAIN-A
+      - CHAIN-B
+      - sk5-ciallo
+      - DIRECT
+
+rules:
+  - MATCH,PROXY

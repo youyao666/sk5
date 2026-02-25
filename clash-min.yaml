@@ -1,0 +1,24 @@
+mixed-port: 7890
+allow-lan: false
+mode: global
+log-level: debug
+ipv6: true
+
+proxies:
+  - name: sk5-ciallo
+    type: socks5
+    server: 155.103.67.133
+    port: 443
+    username: "2602:f66f:70:84::a"
+    password: "dongxuelian1010"
+    udp: false
+
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies:
+      - sk5-ciallo
+      - DIRECT
+
+rules:
+  - MATCH,GLOBAL

@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+
+# Nested/archived projects not part of this repo snapshot
+/github-upload/
+/http-proxy-ipv6-pool-master/
+/http-proxy-ipv6-pool-master.zip
+/sk5/
+/sk5pro/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Logs
+*.log

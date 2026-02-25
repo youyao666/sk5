@@ -1,0 +1,17 @@
+[package]
+name = "ipv6-username-socks5"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+fast-socks5 = "1.0"
+ipnet = "2.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+socket2 = "0.5"
+tokio = { version = "1.43", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-splice = "0.2"

@@ -1,18 +1,20 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
+use axum::{extract::State, response::Html, routing::get, Router};
 use fast_socks5::{
     server::{DnsResolveHelper as _, Socks5ServerProtocol},
     util::target_addr::TargetAddr,
     ReplyError, Socks5Command, SocksError,
 };
-use socket2::{Domain, Protocol, Socket, Type};
 use ipnet::Ipv6Net;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::env;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::signal;
 use tokio::task::JoinSet;
@@ -34,9 +36,27 @@ impl RotationState {
     }
 }
 
+#[derive(Debug)]
+struct Metrics {
+    started_at: Instant,
+    active_connections: AtomicUsize,
+    total_connections: AtomicUsize,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            active_connections: AtomicUsize::new(0),
+            total_connections: AtomicUsize::new(0),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RuntimeConfig {
     listen_port: u16,
+    webui_port: u16,
     request_timeout: Duration,
     shutdown_grace_period: Duration,
     max_connections: usize,
@@ -56,6 +76,15 @@ impl RuntimeConfig {
             })
             .transpose()?
             .unwrap_or(1080);
+
+        let webui_port = env::var("SOCKS5_WEBUI_PORT")
+            .ok()
+            .map(|v| {
+                v.parse::<u16>()
+                    .with_context(|| format!("SOCKS5_WEBUI_PORT 非法: {v}"))
+            })
+            .transpose()?
+            .unwrap_or(18080);
 
         let request_timeout_secs = env::var("SOCKS5_REQUEST_TIMEOUT_SECS")
             .ok()
@@ -106,6 +135,7 @@ impl RuntimeConfig {
 
         Ok(Self {
             listen_port,
+            webui_port,
             request_timeout: Duration::from_secs(request_timeout_secs),
             shutdown_grace_period: Duration::from_secs(shutdown_grace_secs),
             max_connections,
@@ -122,13 +152,18 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cfg = Arc::new(RuntimeConfig::from_env().await?);
+    let metrics = Arc::new(Metrics::new());
+
     let listener = bind_dual_stack_single_port(cfg.listen_port)
         .with_context(|| format!("监听端口 {} 失败", cfg.listen_port))?;
+
+    tokio::spawn(start_webui_server(Arc::clone(&cfg), Arc::clone(&metrics)));
 
     if cfg.allowed_ipv6_cidrs.is_empty() {
         if let Some(v6) = cfg.fixed_public_ipv6 {
             info!(
                 listen = %format!("[::]:{}", cfg.listen_port),
+                webui = %format!("http://127.0.0.1:{}", cfg.webui_port),
                 auth_user_decimal = %ipv6_to_decimal_string(v6),
                 source_ipv6 = %v6,
                 "SOCKS5 代理服务已启动（用户名=IPv6转u128十进制字符串）"
@@ -143,12 +178,13 @@ async fn main() -> Result<()> {
             .join(",");
         info!(
             listen = %format!("[::]:{}", cfg.listen_port),
+            webui = %format!("http://127.0.0.1:{}", cfg.webui_port),
             allowed_ipv6_cidrs = %cidr_list,
             "SOCKS5 代理服务已启动（支持 username=rotation 轮询轮换；或 username=IPv6转u128十进制）"
         );
     }
 
-    run_accept_loop(listener, cfg).await
+    run_accept_loop(listener, cfg, metrics).await
 }
 
 fn init_tracing() {
@@ -159,6 +195,110 @@ fn init_tracing() {
         .with_level(true)
         .compact()
         .init();
+}
+
+#[derive(Clone)]
+struct WebUiState {
+    cfg: Arc<RuntimeConfig>,
+    metrics: Arc<Metrics>,
+}
+
+async fn start_webui_server(cfg: Arc<RuntimeConfig>, metrics: Arc<Metrics>) {
+    let state = WebUiState { cfg, metrics };
+    let app = Router::new()
+        .route("/", get(webui_index))
+        .with_state(state.clone());
+
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], state.cfg.webui_port));
+    match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(listener) => {
+            info!(webui_listen = %bind_addr, "WebUI 面板已启动（只读展示）");
+            if let Err(err) = axum::serve(listener, app).await {
+                error!(error = %err, "WebUI 服务异常退出");
+            }
+        }
+        Err(err) => {
+            error!(error = %err, webui_listen = %bind_addr, "WebUI 监听失败");
+        }
+    }
+}
+
+async fn webui_index(State(state): State<WebUiState>) -> Html<String> {
+    let uptime_secs = state.metrics.started_at.elapsed().as_secs();
+    let active_connections = state.metrics.active_connections.load(Ordering::Relaxed);
+    let total_connections = state.metrics.total_connections.load(Ordering::Relaxed);
+
+    let mode_text = if state.cfg.allowed_ipv6_cidrs.is_empty() {
+        "固定公网 IPv6 / 十进制用户名"
+    } else {
+        "IPv6 池轮询（rotation） + 十进制用户名"
+    };
+
+    let fixed_ipv6_text = state
+        .cfg
+        .fixed_public_ipv6
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "N/A（已启用 IPv6 池）".to_string());
+
+    let cidrs_text = if state.cfg.allowed_ipv6_cidrs.is_empty() {
+        "未配置".to_string()
+    } else {
+        state
+            .cfg
+            .allowed_ipv6_cidrs
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("<br>")
+    };
+
+    let html = format!(
+        r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SOCKS5 WebUI</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; background: #0b1020; color: #e5e7eb; }}
+    .wrap {{ max-width: 920px; margin: 0 auto; padding: 24px; }}
+    h1 {{ margin: 0 0 16px; font-size: 26px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
+    .card {{ background: #11182f; border: 1px solid #1f2a44; border-radius: 12px; padding: 14px; }}
+    .label {{ color: #9ca3af; font-size: 12px; margin-bottom: 6px; }}
+    .value {{ font-size: 18px; font-weight: 600; word-break: break-all; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; }}
+    .footer {{ color: #9ca3af; margin-top: 14px; font-size: 12px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>SOCKS5 运行面板（只读）</h1>
+    <div class="grid">
+      <div class="card"><div class="label">SOCKS5 监听端口</div><div class="value mono">{listen_port}</div></div>
+      <div class="card"><div class="label">WebUI 监听端口</div><div class="value mono">{webui_port}</div></div>
+      <div class="card"><div class="label">运行模式</div><div class="value">{mode_text}</div></div>
+      <div class="card"><div class="label">运行时长（秒）</div><div class="value mono">{uptime_secs}</div></div>
+      <div class="card"><div class="label">活跃连接数</div><div class="value mono">{active_connections}</div></div>
+      <div class="card"><div class="label">累计连接数</div><div class="value mono">{total_connections}</div></div>
+      <div class="card"><div class="label">固定公网 IPv6</div><div class="value mono">{fixed_ipv6_text}</div></div>
+      <div class="card"><div class="label">允许 IPv6 CIDRs</div><div class="value mono">{cidrs_text}</div></div>
+    </div>
+    <div class="footer">仅展示状态，无控制能力。刷新页面可查看最新数据。</div>
+  </div>
+</body>
+</html>"#,
+        listen_port = state.cfg.listen_port,
+        webui_port = state.cfg.webui_port,
+        mode_text = mode_text,
+        uptime_secs = uptime_secs,
+        active_connections = active_connections,
+        total_connections = total_connections,
+        fixed_ipv6_text = fixed_ipv6_text,
+        cidrs_text = cidrs_text,
+    );
+
+    Html(html)
 }
 
 fn bind_dual_stack_single_port(port: u16) -> Result<TcpListener> {
@@ -179,15 +319,17 @@ fn bind_dual_stack_single_port(port: u16) -> Result<TcpListener> {
         .with_context(|| format!("绑定地址 {bind_addr} 失败"))?;
 
     socket.listen(4096).context("socket listen 失败")?;
-    socket
-        .set_nonblocking(true)
-        .context("设置非阻塞失败")?;
+    socket.set_nonblocking(true).context("设置非阻塞失败")?;
 
     let std_listener: std::net::TcpListener = socket.into();
     TcpListener::from_std(std_listener).context("转换为 tokio TcpListener 失败")
 }
 
-async fn run_accept_loop(listener: TcpListener, cfg: Arc<RuntimeConfig>) -> Result<()> {
+async fn run_accept_loop(
+    listener: TcpListener,
+    cfg: Arc<RuntimeConfig>,
+    metrics: Arc<Metrics>,
+) -> Result<()> {
     let mut join_set: JoinSet<()> = JoinSet::new();
     let connection_limiter = Arc::new(tokio::sync::Semaphore::new(cfg.max_connections));
 
@@ -217,11 +359,17 @@ async fn run_accept_loop(listener: TcpListener, cfg: Arc<RuntimeConfig>) -> Resu
                         };
 
                         let task_cfg = Arc::clone(&cfg);
+                        let task_metrics = Arc::clone(&metrics);
                         join_set.spawn(async move {
                             let _permit = permit;
+                            task_metrics.total_connections.fetch_add(1, Ordering::Relaxed);
+                            task_metrics.active_connections.fetch_add(1, Ordering::Relaxed);
+
                             if let Err(err) = handle_client(stream, client_addr, task_cfg).await {
                                 warn!(client = %client_addr, "连接处理失败/已拒绝: {err}");
                             }
+
+                            task_metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
                     Err(err) => {
@@ -275,9 +423,8 @@ async fn handle_client(
     let selected_source_ipv6 = Arc::new(OnceLock::<Ipv6Addr>::new());
     let selected_source_ipv6_closure = Arc::clone(&selected_source_ipv6);
 
-    let (proto_authed, _auth_ok) = Socks5ServerProtocol::accept_password_auth(
-        stream,
-        move |username, password| {
+    let (proto_authed, _auth_ok) =
+        Socks5ServerProtocol::accept_password_auth(stream, move |username, password| {
             let pass_ok = password == expected_password;
             let user_ok = select_source_ipv6_from_username(
                 &username,
@@ -310,19 +457,14 @@ async fn handle_client(
                 "认证失败：用户名或密码错误"
             );
             false
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let outbound_source_v6 = selected_source_ipv6.get().copied();
 
     info!(client = %client_addr, source_ipv6 = ?outbound_source_v6, "认证通过");
 
-    let (proto, cmd, target_addr) = proto_authed
-        .read_command()
-        .await?
-        .resolve_dns()
-        .await?;
+    let (proto, cmd, target_addr) = proto_authed.read_command().await?.resolve_dns().await?;
 
     info!(
         client = %client_addr,
@@ -333,7 +475,13 @@ async fn handle_client(
 
     match cmd {
         Socks5Command::TCPConnect => {
-            run_tcp_proxy_with_ipv6_source(proto, &target_addr, cfg.request_timeout, outbound_source_v6).await?;
+            run_tcp_proxy_with_ipv6_source(
+                proto,
+                &target_addr,
+                cfg.request_timeout,
+                outbound_source_v6,
+            )
+            .await?;
             info!(client = %client_addr, target = %target_addr, source_ipv6 = ?outbound_source_v6, "TCP 转发完成");
             Ok(())
         }
@@ -453,7 +601,10 @@ fn ipv6_from_cidr_and_host_part(cidr: Ipv6Net, host_part: u128) -> Ipv6Addr {
     Ipv6Addr::from(base | normalized_host_part)
 }
 
-fn pick_rotation_ipv6(allowed_ipv6_cidrs: &[Ipv6Net], rotation_state: &RotationState) -> Option<Ipv6Addr> {
+fn pick_rotation_ipv6(
+    allowed_ipv6_cidrs: &[Ipv6Net],
+    rotation_state: &RotationState,
+) -> Option<Ipv6Addr> {
     if allowed_ipv6_cidrs.is_empty() {
         return None;
     }
@@ -554,13 +705,23 @@ async fn proxy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
     {
         match tokio_splice::zero_copy_bidirectional(inbound, outbound).await {
             Ok((up, down)) => {
-                info!(upstream_bytes = up, downstream_bytes = down, zero_copy = true, "零拷贝双向转发结束");
+                info!(
+                    upstream_bytes = up,
+                    downstream_bytes = down,
+                    zero_copy = true,
+                    "零拷贝双向转发结束"
+                );
             }
             Err(err) => {
                 warn!(error = %err, "splice 零拷贝失败，回退 copy_bidirectional");
                 match tokio::io::copy_bidirectional(inbound, outbound).await {
                     Ok((up, down)) => {
-                        info!(upstream_bytes = up, downstream_bytes = down, zero_copy = false, "回退双向转发结束");
+                        info!(
+                            upstream_bytes = up,
+                            downstream_bytes = down,
+                            zero_copy = false,
+                            "回退双向转发结束"
+                        );
                     }
                     Err(copy_err) => {
                         warn!(error = %copy_err, "回退 copy_bidirectional 失败");
@@ -575,7 +736,12 @@ async fn proxy_bidirectional(inbound: &mut TcpStream, outbound: &mut TcpStream) 
     {
         match tokio::io::copy_bidirectional(inbound, outbound).await {
             Ok((up, down)) => {
-                info!(upstream_bytes = up, downstream_bytes = down, zero_copy = false, "双向转发结束");
+                info!(
+                    upstream_bytes = up,
+                    downstream_bytes = down,
+                    zero_copy = false,
+                    "双向转发结束"
+                );
             }
             Err(err) => {
                 warn!(error = %err, "双向转发失败");

@@ -26,6 +26,7 @@
 - `SOCKS5_SHUTDOWN_GRACE_SECS`（可选，默认 `30`）
 - `RUST_LOG`（可选，默认 `info`）
 - `SOCKS5_MAX_CONNECTIONS`（可选，默认 `1024`，用于低内存机器的并发上限保护）
+- `SOCKS5_WEBUI_PORT`（可选，默认 `18080`，只读展示面板端口）
 
 - `SOCKS5_ALLOWED_IPV6_CIDRS`（可选，逗号分隔；配置后将启用 IPv6 池策略，例如 `2001:db8:1::/64,2001:db8:2::/64`）
 
@@ -85,6 +86,7 @@ RUST_LOG=info \
 启动后：
 - 未配置 `SOCKS5_ALLOWED_IPV6_CIDRS`：日志输出固定公网 IPv6 与对应十进制用户名
 - 已配置 `SOCKS5_ALLOWED_IPV6_CIDRS`：日志输出允许网段；可用 `rotation` 或十进制用户名登录
+- 同时启动只读 WebUI 面板（默认 `http://127.0.0.1:18080`，可通过 `SOCKS5_WEBUI_PORT` 修改）
 
 ### 3.4 防火墙放行（示例）
 
@@ -187,11 +189,21 @@ username(十进制) -> parse u128 -> Ipv6Addr::from(u128)
 2. 等待已有连接在宽限时间内完成
 3. 超时后中止剩余任务并退出
 
-## 7. 说明
+## 7. WebUI 只读面板
+
+为方便观察运行状态，服务会额外启动一个只读 HTTP 页面（无控制功能）：
+
+- 默认地址：`http://127.0.0.1:18080`
+- 可通过 `SOCKS5_WEBUI_PORT` 修改端口
+- 展示内容：SOCKS5/WebUI 端口、运行模式、运行时长、活跃连接数、累计连接数、固定公网 IPv6、允许 CIDRs
+
+> 面板仅展示，不提供任何修改配置或控制服务的能力。
+
+## 8. 说明
 
 当前实现依赖 `fast-socks5` 的服务器协议流程与转发逻辑，保持高并发场景下的稳定性与性能。
 
-## 8. Docker 镜像部署
+## 9. Docker 镜像部署
 
 ### 8.1 本地构建镜像
 
@@ -221,7 +233,7 @@ docker run -d \
 -e SOCKS5_ALLOWED_IPV6_CIDRS='2001:db8:1::/64,2001:db8:2::/64'
 ```
 
-## 9. GitHub Actions 自动构建并推送 GHCR
+## 10. GitHub Actions 自动构建并推送 GHCR
 
 项目已提供工作流文件：
 
@@ -242,7 +254,7 @@ docker run -d \
 1. 仓库 `Settings -> Actions -> General` 中允许工作流读写包（`packages: write`）
 2. 仓库可使用默认 `GITHUB_TOKEN` 推送到 GHCR
 
-## 10. ciallo.ee 服务器拉取并运行 GHCR 镜像
+## 11. ciallo.ee 服务器拉取并运行 GHCR 镜像
 
 ### 10.1 登录 GHCR
 

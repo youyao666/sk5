@@ -473,9 +473,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "fast-socks5",
  "ipnet",
  "reqwest",
+ "serde",
+ "serde_json",
  "socket2 0.5.10",
  "tokio",
  "tokio-splice",

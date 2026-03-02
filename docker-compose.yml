@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  sk5:
+    image: ghcr.io/youyao666/ipv6-username-socks5:latest
+    container_name: sk5-proxy
+    restart: always
+    network_mode: host
+
+    environment:
+      # ============ 必填 ============
+      # 连接密码（客户端认证用）
+      - SOCKS5_PASSWORD=changeme
+
+      # ============ IPv6 池（推荐配置）============
+      # 填入服务器的 IPv6 网段，多个用逗号分隔
+      # 例: 2602:f66f:70:84::/64
+      # 不填则使用服务器自动检测的单个公网 IPv6
+      #- SOCKS5_ALLOWED_IPV6_CIDRS=你的IPv6网段/64
+
+      # ============ 订阅设置 ============
+      # 订阅链接中生成的代理节点数量（可在面板上在线修改）
+      - SOCKS5_SUB_NODE_COUNT=100
+
+      # 订阅链接中显示的服务器地址（域名或IP）
+      # 不填则自动检测公网 IP
+      #- SOCKS5_SERVER_HOST=你的域名或IP
+
+      # ============ 可选调优 ============
+      # SOCKS5 代理监听端口（默认 1080）
+      #- SOCKS5_LISTEN_PORT=1080
+
+      # WebUI 控制面板端口（默认 18080）
+      #- SOCKS5_WEBUI_PORT=18080
+
+      # 最大并发连接数（默认 1024）
+      #- SOCKS5_MAX_CONNECTIONS=1024
+
+      # 出站连接超时秒数（默认 10）
+      #- SOCKS5_REQUEST_TIMEOUT_SECS=10
+
+      # 关闭时等待现有连接的宽限秒数（默认 30）
+      #- SOCKS5_SHUTDOWN_GRACE_SECS=30
+
+      # 日志级别: trace, debug, info, warn, error
+      - RUST_LOG=info

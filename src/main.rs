@@ -3,7 +3,9 @@
 use anyhow::{Context, Result};
 use axum::{
     extract::State,
-    response::{Html, IntoResponse},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -75,6 +77,8 @@ struct RuntimeConfig {
     server_host: String,
     /// 订阅链接中生成的独立 IPv6 节点数量（可在线修改）
     sub_node_count: AtomicUsize,
+    /// WebUI / API 访问密码（通过 SOCKS5_WEBUI_PASSWORD 设置，默认 admin）
+    webui_password: String,
 }
 
 impl RuntimeConfig {
@@ -144,6 +148,11 @@ impl RuntimeConfig {
             .transpose()?
             .unwrap_or(10);
 
+        let webui_password = env::var("SOCKS5_WEBUI_PASSWORD")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "admin".to_string());
+
         let allowed_ipv6_cidrs = parse_allowed_ipv6_cidrs_from_env()?;
         let fixed_public_ipv6 = if allowed_ipv6_cidrs.is_empty() {
             Some(detect_public_ipv6().await?)
@@ -178,6 +187,7 @@ impl RuntimeConfig {
             rotation_state,
             server_host,
             sub_node_count: AtomicUsize::new(sub_node_count),
+            webui_password,
         })
     }
 }
@@ -253,12 +263,16 @@ async fn start_webui_server(cfg: Arc<RuntimeConfig>, metrics: Arc<Metrics>) {
         .route("/sub/plain", get(sub_plain))
         .route("/api/settings", post(api_update_settings))
         .route("/api/nodes", get(api_get_nodes))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            basic_auth_middleware,
+        ))
         .with_state(state.clone());
 
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], state.cfg.webui_port));
     match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(listener) => {
-            info!(webui_listen = %bind_addr, "WebUI 面板已启动（只读展示）");
+            info!(webui_listen = %bind_addr, "WebUI 面板已启动（需密码认证）");
             if let Err(err) = axum::serve(listener, app).await {
                 error!(error = %err, "WebUI 服务异常退出");
             }
@@ -267,6 +281,44 @@ async fn start_webui_server(cfg: Arc<RuntimeConfig>, metrics: Arc<Metrics>) {
             error!(error = %err, webui_listen = %bind_addr, "WebUI 监听失败");
         }
     }
+}
+
+/// HTTP Basic Auth 中间件：所有 WebUI 和 API 请求需要认证
+/// 用户名: admin（固定），密码: SOCKS5_WEBUI_PASSWORD 环境变量（默认 admin）
+async fn basic_auth_middleware(
+    State(state): State<WebUiState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let expected_password = &state.cfg.webui_password;
+
+    // 检查 Authorization header
+    if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(encoded) = auth_str.strip_prefix("Basic ") {
+                if let Ok(decoded) = BASE64.decode(encoded) {
+                    if let Ok(credentials) = String::from_utf8(decoded) {
+                        // 格式: username:password，用户名固定为 admin
+                        if let Some((_user, pass)) = credentials.split_once(':') {
+                            if pass == expected_password {
+                                return next.run(req).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 认证失败，返回 401 并要求浏览器弹出登录框
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(
+            header::WWW_AUTHENTICATE,
+            "Basic realm=\"SK5 Control Panel\"",
+        )
+        .body(axum::body::Body::from("Unauthorized"))
+        .unwrap()
 }
 
 async fn webui_index(State(state): State<WebUiState>) -> Html<String> {
